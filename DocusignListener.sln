@@ -1,9 +1,11 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
-VisualStudioVersion = 17.14.36518.9 d17.14
+VisualStudioVersion = 17.14.36518.9
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DocusignListener", "DocusignListener\DocusignListener.csproj", "{39DC67AA-B493-4A29-A5DB-83FE0C5EC7CE}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CrmInvoker", "CrmInvoker\CrmInvoker.csproj", "{EB989318-1F85-4E9F-BE7B-F14ED2BDD100}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -15,6 +17,10 @@ Global
 		{39DC67AA-B493-4A29-A5DB-83FE0C5EC7CE}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{39DC67AA-B493-4A29-A5DB-83FE0C5EC7CE}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{39DC67AA-B493-4A29-A5DB-83FE0C5EC7CE}.Release|Any CPU.Build.0 = Release|Any CPU
+		{EB989318-1F85-4E9F-BE7B-F14ED2BDD100}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{EB989318-1F85-4E9F-BE7B-F14ED2BDD100}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{EB989318-1F85-4E9F-BE7B-F14ED2BDD100}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{EB989318-1F85-4E9F-BE7B-F14ED2BDD100}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

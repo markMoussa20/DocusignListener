@@ -1,167 +1,183 @@
-﻿// Program.cs — diagnostics build
-using Microsoft.Crm.Sdk.Messages;
-using Microsoft.Xrm.Sdk;
-using Microsoft.Xrm.Tooling.Connector;
+﻿// Program.cs — DocuSign Listener (NET 8) → shells to CrmInvoker (.NET 4.8)
+// No Xrm.Tooling here. All CRM happens in CrmInvoker.exe
+
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 
 var builder = WebApplication.CreateBuilder(args);
-
-const bool REQUIRE_BASIC = true;
-const bool REQUIRE_HMAC = false; // keep off while testing with Postman
-const bool ACK_FAST = false; // do sync while debugging
-const bool TRACE = true;
-
 builder.WebHost.UseKestrel(o => o.Limits.MaxRequestBodySize = 50 * 1024 * 1024);
 var app = builder.Build();
 
-/* -------------------- CONFIG (EDIT THESE TWO LINES!) -------------------- */
-// If you built a Custom Action (recommended on on-prem), this must be the Action's Unique Name.
-const string CRM_OPERATION_NAME = "ntw_DocuSign_Ingress";   // <-- put the EXACT action unique name
-// This must be the EXACT input parameter logical name in the Action.
-const string CRM_INPUT_PARAM_NAME = "RequestBody";            // <-- e.g. "ntw_RequestBody" if that’s what you created
-/* ----------------------------------------------------------------------- */
+// -------- settings you can leave as-is for Postman testing ----------
+const bool REQUIRE_BASIC = true;
+const bool REQUIRE_HMAC = false;  // keep false for Postman
+const bool ACK_FAST = false;  // do sync while debugging
+const bool TRACE = true;
 
-// Auth + CRM connection
 const string BASIC_USER = "mhmoussa@netwaysdev.local";
 const string BASIC_PASS = "MhM@123456";
-const string DS_SECRET_B64 = "UVgtL9C2kRNesCFOFi3DQngDJT4+GCR8ETohooZhwfU=";
+const string DS_SECRET_B64 = "";   // fill when you enable HMAC
 
-const string CRM_URL = "http://10.141.0.170/CrmUat"; // must include org
-const string CRM_DOMAIN = "netwaysdev";
-const string CRM_USERNAME = "mhmoussa@Netwaysdev.local";  // UPN or DOMAIN\user
-const string CRM_PASSWORD = "MhM@123456";
+// CRM creds are NOT used here anymore. They are used by CrmInvoker.exe
+// -------------------------------------------------------------------
 
-app.MapGet("/", () => Results.Ok("Listener up"));
 app.MapGet("/healthz", () => Results.Ok("ok"));
-
-app.MapGet("/selftest", () =>
-{
-    try
-    {
-        using var client = new CrmServiceClient(BuildAdConnString(CRM_URL, CRM_DOMAIN, CRM_USERNAME, CRM_PASSWORD));
-        if (!client.IsReady)
-            return Results.Json(new { ok = false, where = "connect", error = client.LastCrmError });
-
-        var resp = (WhoAmIResponse)client.Execute(new WhoAmIRequest());
-        return Results.Json(new { ok = true, userId = resp.UserId.ToString() });
-    }
-    catch (Exception ex)
-    {
-        return Results.Json(new { ok = false, where = "exception", error = ex.Message });
-    }
-});
 
 app.MapPost("/docusign/webhook", async (HttpContext ctx) =>
 {
-    var cid = Guid.NewGuid().ToString("N");
+    var id = Guid.NewGuid().ToString("N");
 
-    // Basic auth
-    if (REQUIRE_BASIC && !IsBasicAuthValid(ctx.Request.Headers.Authorization, BASIC_USER, BASIC_PASS, TRACE))
-        return Results.Unauthorized();
-
-    // Read body
-    ctx.Request.EnableBuffering();
-    byte[] raw;
-    using (var ms = new MemoryStream())
+    try
     {
-        await ctx.Request.Body.CopyToAsync(ms);
-        raw = ms.ToArray();
-    }
-    ctx.Request.Body.Position = 0;
+        // 1) Basic auth
+        if (REQUIRE_BASIC && !IsBasicAuthValid(ctx.Request.Headers.Authorization, BASIC_USER, BASIC_PASS, TRACE))
+            return Results.Json(new { ok = false, source = "listener", where = "auth", id, error = "401 basic-auth failed" }, statusCode: 401);
 
-    if (REQUIRE_HMAC)
-    {
-        var sigHeader = ctx.Request.Headers["X-DocuSign-Signature-1"].ToString();
-        if (string.IsNullOrWhiteSpace(sigHeader) || string.IsNullOrWhiteSpace(DS_SECRET_B64) || !VerifyHmac(DS_SECRET_B64, raw, sigHeader))
-            return Results.Unauthorized();
-    }
+        // 2) Read body
+        ctx.Request.EnableBuffering();
+        byte[] raw;
+        using (var ms = new MemoryStream()) { await ctx.Request.Body.CopyToAsync(ms); raw = ms.ToArray(); }
+        ctx.Request.Body.Position = 0;
 
-    var action = async () =>
-    {
-        try
+        // 3) Optional HMAC
+        if (REQUIRE_HMAC)
         {
-            var bodyText = Encoding.UTF8.GetString(raw);
+            var sig = ctx.Request.Headers["X-DocuSign-Signature-1"].ToString();
+            if (string.IsNullOrWhiteSpace(sig) || !VerifyHmac(DS_SECRET_B64, raw, sig))
+                return Results.Json(new { ok = false, source = "listener", where = "hmac", id, error = "bad/missing HMAC" }, statusCode: 401);
+        }
 
-            using var client = new CrmServiceClient(BuildAdConnString(CRM_URL, CRM_DOMAIN, CRM_USERNAME, CRM_PASSWORD));
-            if (!client.IsReady)
-                throw new Exception("CrmServiceClient not ready: " + client.LastCrmError);
+        // 4) Parse JSON quickly (just to echo tiny fields into the invoker log)
+        JsonNode? root;
+        try { root = JsonNode.Parse(raw); }
+        catch (Exception jex)
+        {
+            return Results.Json(new { ok = false, source = "listener", where = "json", id, error = jex.Message }, statusCode: 400);
+        }
 
-            // IMPORTANT: operation name and parameter name must match your Action definition
-            var req = new OrganizationRequest(CRM_OPERATION_NAME)
+        var payload = new
+        {
+            // send original payload as a string to the invoker (no shape assumptions)
+            body = Encoding.UTF8.GetString(raw),
+
+            // optional crumbs for invoker logs
+            eventName = root?["event"]?.ToString(),
+            envelopeId = root?["data"]?["envelopeId"]?.ToString()
+        };
+
+        var invokerPath = ResolveInvokerPath(builder.Configuration);
+        if (invokerPath == null)
+        {
+            return Results.Json(new
             {
-                Parameters = { [CRM_INPUT_PARAM_NAME] = bodyText }
-            };
-
-            var result = client.Execute(req); // usually OrganizationResponse with no params for Actions
-            if (TRACE) Console.WriteLine($"[{cid}] Executed '{CRM_OPERATION_NAME}' with param '{CRM_INPUT_PARAM_NAME}' len={bodyText.Length}");
+                ok = false,
+                source = "listener",
+                where = "invoke",
+                id,
+                error = "CrmInvoker.exe not found. Expected under 'CrmInvoker\\CrmInvoker.exe' or 'CrmInvoker\\net8.0\\CrmInvoker.exe' beside the listener. " +
+                        "You can also set an absolute path via appsettings.json: { \"InvokerPath\": \"C:\\\\path\\\\CrmInvoker.exe\" }"
+            }, statusCode: 500);
         }
-        catch (Exception ex)
+
+        if (ACK_FAST)
         {
-            Console.Error.WriteLine($"[{cid}] CRM call failed: {ex.Message}");
-            throw;
+            _ = Task.Run(() => RunInvoker(invokerPath, payload, id, TRACE));
+            return Results.Json(new { ok = true, source = "listener", queued = true, id });
         }
-    };
-
-    if (ACK_FAST)
-    {
-        _ = Task.Run(action);
-        return Results.Json(new { ok = true, id = cid, queued = true });
+        else
+        {
+            var (ok, err, stdout) = await RunInvoker(invokerPath, payload, id, TRACE);
+            return Results.Json(new { ok, source = "listener", queued = false, id, error = err, invoker = stdout });
+        }
     }
-    else
+    catch (Exception ex)
     {
-        await action();
-        return Results.Json(new { ok = true, id = cid, queued = false });
+        return Results.Json(new { ok = false, source = "listener", where = "exception", id, error = ex.Message }, statusCode: 500);
     }
 });
 
 app.Run();
 
-/* ---------------- helpers ---------------- */
-static string BuildAdConnString(string url, string domain, string user, string pass)
+static bool IsBasicAuthValid(string? authHeader, string user, string pass, bool trace = false)
 {
-    var userFmt = user.Contains('\\') || user.Contains('@') ? user : $"{domain}\\{user}";
-    return $"""
-AuthType=AD;
-Url={url};
-Domain={domain};
-Username={userFmt};
-Password={pass};
-""";
-}
-
-static bool IsBasicAuthValid(string? authHeader, string expectedUser, string expectedPass, bool trace = false)
-{
-    if (string.IsNullOrEmpty(expectedUser) && string.IsNullOrEmpty(expectedPass)) return true;
+    if (string.IsNullOrEmpty(user) && string.IsNullOrEmpty(pass)) return true;
     if (string.IsNullOrWhiteSpace(authHeader) || !authHeader.StartsWith("Basic ", StringComparison.OrdinalIgnoreCase)) return false;
-
     try
     {
-        var b64 = authHeader.Substring("Basic ".Length).Trim();
-        var raw = Encoding.UTF8.GetString(Convert.FromBase64String(b64));
+        var raw = Encoding.UTF8.GetString(Convert.FromBase64String(authHeader["Basic ".Length..].Trim()));
         var i = raw.IndexOf(':'); if (i < 0) return false;
         var u = raw[..i]; var p = raw[(i + 1)..];
-
-        var ok = (u.Equals(expectedUser, StringComparison.OrdinalIgnoreCase) || NormalizeUser(u).Equals(NormalizeUser(expectedUser), StringComparison.OrdinalIgnoreCase))
-                 && p == expectedPass;
-
-        if (trace) Console.WriteLine($"[AUTH] user={u}, match={ok}");
+        var ok = p == pass && (u.Equals(user, StringComparison.OrdinalIgnoreCase) || Normalize(u).Equals(Normalize(user), StringComparison.OrdinalIgnoreCase));
+        if (trace) Console.WriteLine($"[AUTH] user={u}, ok={ok}");
         return ok;
 
-        static string NormalizeUser(string s) => s.Contains('@')
-            ? $"{s.Split('@')[1].Split('.')[0]}\\{s.Split('@')[0]}"
-            : s;
+        static string Normalize(string s) => s.Contains('@') ? $"{s.Split('@')[1].Split('.')[0]}\\{s.Split('@')[0]}" : s;
     }
     catch { return false; }
 }
 
-static bool VerifyHmac(string secretB64, byte[] payload, string sigHeaderB64)
+static bool VerifyHmac(string secretB64, byte[] payload, string sigB64)
 {
     try
     {
-        using var hmac = new HMACSHA256(Convert.FromBase64String(secretB64));
-        var calcB64 = Convert.ToBase64String(hmac.ComputeHash(payload));
-        return CryptographicOperations.FixedTimeEquals(Encoding.ASCII.GetBytes(calcB64), Encoding.ASCII.GetBytes(sigHeaderB64));
+        using var h = new HMACSHA256(Convert.FromBase64String(secretB64));
+        var calc = Convert.ToBase64String(h.ComputeHash(payload));
+        return CryptographicOperations.FixedTimeEquals(Encoding.ASCII.GetBytes(calc), Encoding.ASCII.GetBytes(sigB64));
     }
     catch { return false; }
+}
+
+static string? ResolveInvokerPath(IConfiguration cfg)
+{
+    // 1) explicit setting from appsettings.json or environment variable
+    var fromConfig = cfg["InvokerPath"];
+    if (!string.IsNullOrWhiteSpace(fromConfig) && File.Exists(fromConfig))
+        return Path.GetFullPath(fromConfig);
+
+    // 2) relative probes near the listener output folder
+    var baseDir = AppContext.BaseDirectory.TrimEnd('\\', '/');
+
+    var probes = new[]
+    {
+        // flat beside the listener
+        Path.Combine(baseDir, "CrmInvoker", "CrmInvoker.exe"),
+        // TFM folders we may have copied
+        Path.Combine(baseDir, "CrmInvoker", "net8.0", "CrmInvoker.exe"),
+        Path.Combine(baseDir, "CrmInvoker", "net48", "CrmInvoker.exe"),   // <-- add this
+    };
+
+    foreach (var p in probes)
+        if (File.Exists(p)) return p;
+
+    return null;
+}
+
+static async Task<(bool ok, string? err, string? stdout)> RunInvoker(string exePath, object payload, string correlationId, bool trace)
+{
+    var json = JsonSerializer.Serialize(payload);
+    var psi = new ProcessStartInfo
+    {
+        FileName = exePath,
+        Arguments = "--stdin",
+        RedirectStandardInput = true,
+        RedirectStandardOutput = true,
+        RedirectStandardError = true,
+        UseShellExecute = false,
+        CreateNoWindow = true,
+        WorkingDirectory = Path.GetDirectoryName(exePath)!
+    };
+
+    using var p = Process.Start(psi)!;
+    await p.StandardInput.WriteAsync(json);
+    p.StandardInput.Close();
+
+    var stdout = await p.StandardOutput.ReadToEndAsync();
+    var stderr = await p.StandardError.ReadToEndAsync();
+    await p.WaitForExitAsync();
+
+    if (trace) Console.WriteLine($"[Invoker:{correlationId}] exit={p.ExitCode}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}");
+    return (p.ExitCode == 0, p.ExitCode == 0 ? null : (stderr ?? "invoker failed"), stdout);
 }
