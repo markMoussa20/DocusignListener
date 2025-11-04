@@ -1,5 +1,5 @@
-﻿// Program.cs — DocuSign Listener (NET 8) → shells to CrmInvoker (.NET 4.8)
-// No Xrm.Tooling here. All CRM happens in CrmInvoker.exe
+﻿// Program.cs — DocuSign Listener (NET 8) → shells to CrmInvoker (.NET Framework 4.8)
+// All CRM logic is in CrmInvoker.exe. This app just receives and forwards.
 
 using System.Diagnostics;
 using System.Security.Cryptography;
@@ -11,18 +11,16 @@ var builder = WebApplication.CreateBuilder(args);
 builder.WebHost.UseKestrel(o => o.Limits.MaxRequestBodySize = 50 * 1024 * 1024);
 var app = builder.Build();
 
-// -------- settings you can leave as-is for Postman testing ----------
+// -------- settings for local testing ----------
 const bool REQUIRE_BASIC = true;
-const bool REQUIRE_HMAC = false;  // keep false for Postman
-const bool ACK_FAST = false;  // do sync while debugging
+const bool REQUIRE_HMAC = false; // keep false for Postman
+const bool ACK_FAST = false; // do sync while debugging
 const bool TRACE = true;
 
 const string BASIC_USER = "mhmoussa@netwaysdev.local";
 const string BASIC_PASS = "MhM@123456";
-const string DS_SECRET_B64 = "";   // fill when you enable HMAC
-
-// CRM creds are NOT used here anymore. They are used by CrmInvoker.exe
-// -------------------------------------------------------------------
+const string DS_SECRET_B64 = ""; // fill when you enable HMAC
+// ---------------------------------------------
 
 app.MapGet("/healthz", () => Results.Ok("ok"));
 
@@ -42,7 +40,7 @@ app.MapPost("/docusign/webhook", async (HttpContext ctx) =>
         using (var ms = new MemoryStream()) { await ctx.Request.Body.CopyToAsync(ms); raw = ms.ToArray(); }
         ctx.Request.Body.Position = 0;
 
-        // 3) Optional HMAC
+        // 3) Optional HMAC (DocuSign X-DocuSign-Signature-1)
         if (REQUIRE_HMAC)
         {
             var sig = ctx.Request.Headers["X-DocuSign-Signature-1"].ToString();
@@ -50,7 +48,7 @@ app.MapPost("/docusign/webhook", async (HttpContext ctx) =>
                 return Results.Json(new { ok = false, source = "listener", where = "hmac", id, error = "bad/missing HMAC" }, statusCode: 401);
         }
 
-        // 4) Parse JSON quickly (just to echo tiny fields into the invoker log)
+        // 4) Parse small crumbs (for logging only)
         JsonNode? root;
         try { root = JsonNode.Parse(raw); }
         catch (Exception jex)
@@ -58,14 +56,21 @@ app.MapPost("/docusign/webhook", async (HttpContext ctx) =>
             return Results.Json(new { ok = false, source = "listener", where = "json", id, error = jex.Message }, statusCode: 400);
         }
 
+        // 5) Optional validation token forwarded to invoker (header name flexible)
+        var validationToken =
+               ctx.Request.Headers["validationToken"].ToString()
+            ?? ctx.Request.Headers["X-Validation-Token"].ToString();
+
         var payload = new
         {
-            // send original payload as a string to the invoker (no shape assumptions)
-            body = Encoding.UTF8.GetString(raw),
+            body = Encoding.UTF8.GetString(raw), // original DocuSign JSON (no shape assumptions)
 
-            // optional crumbs for invoker logs
+            // tiny crumbs (helpful in stdout)
             eventName = root?["event"]?.ToString(),
-            envelopeId = root?["data"]?["envelopeId"]?.ToString()
+            envelopeId = root?["data"]?["envelopeId"]?.ToString(),
+
+            // forwarded token (if present)
+            validationToken = string.IsNullOrWhiteSpace(validationToken) ? null : validationToken
         };
 
         var invokerPath = ResolveInvokerPath(builder.Configuration);
@@ -77,8 +82,8 @@ app.MapPost("/docusign/webhook", async (HttpContext ctx) =>
                 source = "listener",
                 where = "invoke",
                 id,
-                error = "CrmInvoker.exe not found. Expected under 'CrmInvoker\\CrmInvoker.exe' or 'CrmInvoker\\net8.0\\CrmInvoker.exe' beside the listener. " +
-                        "You can also set an absolute path via appsettings.json: { \"InvokerPath\": \"C:\\\\path\\\\CrmInvoker.exe\" }"
+                error = "CrmInvoker.exe not found. Expected under 'CrmInvoker\\CrmInvoker.exe' or 'CrmInvoker\\net48\\CrmInvoker.exe' beside the listener. " +
+                        "Or set appsettings.json: { \"InvokerPath\": \"C:\\\\path\\\\CrmInvoker.exe\" }"
             }, statusCode: 500);
         }
 
@@ -132,23 +137,19 @@ static bool VerifyHmac(string secretB64, byte[] payload, string sigB64)
 
 static string? ResolveInvokerPath(IConfiguration cfg)
 {
-    // 1) explicit setting from appsettings.json or environment variable
+    // 1) explicit setting from appsettings.json or env
     var fromConfig = cfg["InvokerPath"];
     if (!string.IsNullOrWhiteSpace(fromConfig) && File.Exists(fromConfig))
         return Path.GetFullPath(fromConfig);
 
     // 2) relative probes near the listener output folder
     var baseDir = AppContext.BaseDirectory.TrimEnd('\\', '/');
-
     var probes = new[]
     {
-        // flat beside the listener
         Path.Combine(baseDir, "CrmInvoker", "CrmInvoker.exe"),
-        // TFM folders we may have copied
+        Path.Combine(baseDir, "CrmInvoker", "net48", "CrmInvoker.exe"),
         Path.Combine(baseDir, "CrmInvoker", "net8.0", "CrmInvoker.exe"),
-        Path.Combine(baseDir, "CrmInvoker", "net48", "CrmInvoker.exe"),   // <-- add this
     };
-
     foreach (var p in probes)
         if (File.Exists(p)) return p;
 
