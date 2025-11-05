@@ -13,18 +13,31 @@ var app = builder.Build();
 
 // -------- settings for local testing ----------
 const bool REQUIRE_BASIC = true;
-const bool REQUIRE_HMAC = false; // keep false for Postman
-const bool ACK_FAST = false; // do sync while debugging
+const bool REQUIRE_HMAC = false;  // keep false for Postman
+const bool ACK_FAST = false;  // do sync while debugging
 const bool TRACE = true;
 
 const string BASIC_USER = "mhmoussa@netwaysdev.local";
 const string BASIC_PASS = "MhM@123456";
-const string DS_SECRET_B64 = ""; // fill when you enable HMAC
+const string DS_SECRET_B64 = "";   // fill when you enable HMAC
 // ---------------------------------------------
 
 app.MapGet("/healthz", () => Results.Ok("ok"));
 
-app.MapPost("/docusign/webhook", async (HttpContext ctx) =>
+// Accept both the clean route and any IIS-added tail like /default.aspx
+app.MapPost("/docusign/webhook", HandleWebhook);
+app.MapPost("/docusign/webhook/{**_}", HandleWebhook);
+
+// DEBUG ONLY - catch-all test route (GET)
+app.MapGet("/{**any}", (HttpContext ctx) =>
+{
+    return Results.Text($"Listener is running. You hit: {ctx.Request.Path}");
+});
+
+app.Run();
+
+// ===== Handlers =====
+async Task<IResult> HandleWebhook(HttpContext ctx)
 {
     var id = Guid.NewGuid().ToString("N");
 
@@ -63,7 +76,7 @@ app.MapPost("/docusign/webhook", async (HttpContext ctx) =>
 
         var payload = new
         {
-            body = Encoding.UTF8.GetString(raw), // original DocuSign JSON (no shape assumptions)
+            body = Encoding.UTF8.GetString(raw), // original DocuSign JSON
 
             // tiny crumbs (helpful in stdout)
             eventName = root?["event"]?.ToString(),
@@ -102,10 +115,9 @@ app.MapPost("/docusign/webhook", async (HttpContext ctx) =>
     {
         return Results.Json(new { ok = false, source = "listener", where = "exception", id, error = ex.Message }, statusCode: 500);
     }
-});
+}
 
-app.Run();
-
+// ===== Helpers =====
 static bool IsBasicAuthValid(string? authHeader, string user, string pass, bool trace = false)
 {
     if (string.IsNullOrEmpty(user) && string.IsNullOrEmpty(pass)) return true;
