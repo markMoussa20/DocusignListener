@@ -1,28 +1,10 @@
-﻿// CrmInvoker/Program.cs  — .NET Framework 4.8
-// NuGet: Microsoft.CrmSdk.CoreAssemblies, Microsoft.CrmSdk.XrmTooling.CoreAssembly,
-//        System.Configuration.ConfigurationManager, Newtonsoft.Json
-//
-// Reads { body: "<RAW_DOCUSIGN_JSON>" } from STDIN (written by the listener)
-// and performs all CRM work *directly* (on-prem safe).
-//
-// Behavior:
-// - Create ntw_webhooklog (Active/Received) for every call
-// - Validate "validationToken" from payload against env var (optional; if not configured → allow)
-// - Find ntw_docusignlog by Envelope ID
-// - Add small audit note (no file) for traceability
-// - On completed:
-//      • Upload the signed PDF to ntw_docusignlog.ntw_signeddocument via File-Blocks API
-//      • Set statecode = 1 (Inactive), statuscode = 202370005 (Signed)
-// - On finish-later / declined: just mark webhook log processed with the reason
-
+﻿// CrmInvoker/Program.cs — custom-API-only build
 using System;
 using System.Configuration;
 using System.IO;
 using System.Linq;
 using System.Net;
 using System.Text;
-using System.Collections.Generic;
-using System.ServiceModel;                 // FaultException<OrganizationServiceFault>
 using Microsoft.Xrm.Sdk;
 using Microsoft.Xrm.Sdk.Query;
 using Microsoft.Xrm.Tooling.Connector;
@@ -32,94 +14,48 @@ namespace CrmInvoker
 {
     internal static class Program
     {
-        // Hard values you requested
-        private const int STATE_INACTIVE = 1;        // statecode
-        private const int STATUS_SIGNED = 202370005; // statuscode (Signed)
+        private const string VERSION = "CRMINVOKER-APIONLY-2025-11-12T15:00Z";
+        private const int STATE_INACTIVE = 1;
+        private const int STATUS_SIGNED = 202370005;
 
         private static int Main()
         {
-            // TLS for older boxes
+            Console.Error.WriteLine($"[BOOT] {VERSION}");
+            Console.Error.WriteLine($"[BOOT] EXE: {System.Reflection.Assembly.GetExecutingAssembly().Location}");
+            Console.Error.WriteLine("[BOOT] USING CUSTOM API: ntw_UploadBase64ToFile");
+
             ServicePointManager.SecurityProtocol =
                 SecurityProtocolType.Tls12 | SecurityProtocolType.Tls11 | SecurityProtocolType.Tls;
 
-            // 1) Read STDIN
+            // 1) Read stdin
             string stdin;
             using (var sr = new StreamReader(Console.OpenStandardInput(), Encoding.UTF8))
                 stdin = sr.ReadToEnd();
 
-            // Expect: { "body": "<RAW_DOCUSIGN_JSON>" }
+            // 2) Parse wrapper { body: "..." }
             string rawBody = "";
-            try
-            {
-                var outer = JToken.Parse(string.IsNullOrWhiteSpace(stdin) ? "{}" : stdin);
-                rawBody = (string)outer["body"] ?? "";
-            }
+            try { rawBody = (string)JToken.Parse(string.IsNullOrWhiteSpace(stdin) ? "{}" : stdin)["body"] ?? ""; }
             catch (Exception ex)
             {
-                Console.Out.WriteLine(Newtonsoft.Json.JsonConvert.SerializeObject(new
-                {
-                    ok = false,
-                    source = "invoker",
-                    where = "parse-stdin",
-                    error = ex.Message
-                }));
+                WriteResult(false, "invoker", "parse-stdin", ex.Message);
                 return 1;
             }
 
-            // 2) Parse DocuSign JSON (tolerant)
-            string eventName = "";
-            string envelopeId = "";
-            string status = "";
-            string emailSubject = "";
-            string senderUser = "";
-            string senderMail = "";
-            string validationTokenIncoming = "";
-            string pdfBase64 = "";
-            string docName = "";
+            // 3) Parse DocuSign JSON (tolerant)
+            string eventName = "", envelopeId = "", status = "", emailSubject = "", senderUser = "", senderMail = "", validationTokenIncoming = "";
+            string pdfBase64 = "", docName = "";
 
             try
             {
                 var root = string.IsNullOrWhiteSpace(rawBody) ? null : JToken.Parse(rawBody);
-
-                eventName =
-                       (string)root?["event"]
-                    ?? (string)root?["eventType"]
-                    ?? (string)root?["type"]
-                    ?? "";
-
-                envelopeId =
-                       (string)root?["data"]?["envelopeId"]
-                    ?? (string)root?["envelopeId"]
-                    ?? "";
-
-                status =
-                       (string)root?["data"]?["envelopeSummary"]?["status"]
-                    ?? (string)root?["summary"]?["status"]
-                    ?? (string)root?["status"]
-                    ?? "";
-
-                emailSubject =
-                       (string)root?["data"]?["envelopeSummary"]?["emailSubject"]
-                    ?? (string)root?["summary"]?["emailSubject"]
-                    ?? (string)root?["emailSubject"]
-                    ?? "";
-
-                senderUser =
-                       (string)root?["data"]?["envelopeSummary"]?["sender"]?["userName"]
-                    ?? (string)root?["summary"]?["senderUserName"]
-                    ?? (string)root?["sender"]?["userName"]
-                    ?? "";
-
-                senderMail =
-                       (string)root?["data"]?["envelopeSummary"]?["sender"]?["email"]
-                    ?? (string)root?["summary"]?["senderEmail"]
-                    ?? (string)root?["sender"]?["email"]
-                    ?? "";
-
-                // Optional validation token
+                eventName = (string)root?["event"] ?? (string)root?["eventType"] ?? (string)root?["type"] ?? "";
+                envelopeId = (string)root?["data"]?["envelopeId"] ?? (string)root?["envelopeId"] ?? "";
+                status = (string)root?["data"]?["envelopeSummary"]?["status"] ?? (string)root?["summary"]?["status"] ?? (string)root?["status"] ?? "";
+                emailSubject = (string)root?["data"]?["envelopeSummary"]?["emailSubject"] ?? (string)root?["summary"]?["emailSubject"] ?? (string)root?["emailSubject"] ?? "";
+                senderUser = (string)root?["data"]?["envelopeSummary"]?["sender"]?["userName"] ?? (string)root?["summary"]?["senderUserName"] ?? (string)root?["sender"]?["userName"] ?? "";
+                senderMail = (string)root?["data"]?["envelopeSummary"]?["sender"]?["email"] ?? (string)root?["summary"]?["senderEmail"] ?? (string)root?["sender"]?["email"] ?? "";
                 validationTokenIncoming = (string)root?["validationToken"] ?? "";
 
-                // First document (typical Connect payload)
                 var doc = root?["data"]?["envelopeSummary"]?["envelopeDocuments"]?.First;
                 if (doc != null)
                 {
@@ -128,28 +64,16 @@ namespace CrmInvoker
                     docName = EnsurePdfName(n);
                 }
             }
-            catch (Exception ex)
-            {
-                // proceed; CRM step will fail gracefully if required inputs are missing
-                Console.Error.WriteLine("[Invoker] JSON parse warning: " + ex.Message);
-            }
+            catch (Exception ex) { Console.Error.WriteLine("[WARN] JSON parse: " + ex.Message); }
 
-            // Quick pre-flight: event + envelopeId are mandatory
             if (string.IsNullOrWhiteSpace(eventName) || string.IsNullOrWhiteSpace(envelopeId))
             {
-                Console.Out.WriteLine(Newtonsoft.Json.JsonConvert.SerializeObject(new
-                {
-                    ok = false,
-                    source = "crm",
-                    where = "execute",
-                    error = "Missing required fields (event / envelopeId) in DocuSign payload."
-                }));
+                WriteResult(false, "crm", "execute", "Missing required fields (event / envelopeId) in DocuSign payload.");
                 return 2;
             }
 
-            // 3) CRM connection
+            // 4) CRM connect
             var crmConnString = ConfigurationManager.ConnectionStrings["CRMConnectionString"]?.ConnectionString;
-
             try
             {
                 using (var client = new CrmServiceClient(crmConnString))
@@ -158,58 +82,32 @@ namespace CrmInvoker
                         throw new Exception("CrmServiceClient not ready: " + (client.LastCrmError ?? "unknown"));
 
                     var org = (IOrganizationService)client.OrganizationServiceProxy ?? client;
-
-                    // Correlation for this run
                     var correlationId = Guid.NewGuid().ToString("N");
 
-                    // 4) Create webhook log (Active/Received)
-                    var webhookLogId = CreateWebhookLog(org,
-                        correlationId,
-                        eventName,
-                        envelopeId,
-                        status,
-                        senderUser,
-                        senderMail,
-                        rawBody);
+                    var webhookLogId = CreateWebhookLog(org, correlationId, eventName, envelopeId, status, senderUser, senderMail, rawBody);
 
-                    // 5) Validate source token (optional)
-                    if (!IsValidSourceToken(org, validationTokenIncoming))
+                    // Validate source (optional)
+                    if (!IsValidSourceToken(org, ConfigurationManager.AppSettings["Env.WebhookValidationToken.Schema"] ?? "", validationTokenIncoming))
                     {
-                        MarkWebhookLogFinal(org, webhookLogId, success: false, failedReason: "Invalid validationToken");
-                        Console.Out.WriteLine(Newtonsoft.Json.JsonConvert.SerializeObject(new
-                        {
-                            ok = false,
-                            source = "crm",
-                            where = "execute",
-                            error = "Invalid validationToken"
-                        }));
+                        MarkWebhookLogFinal(org, webhookLogId, false, "Invalid validationToken");
+                        WriteResult(false, "crm", "execute", "Invalid validationToken");
                         return 2;
                     }
 
-                    // 6) Find DocuSign log by envelopeId
+                    // Find ntw_docusignlog by envelope id
                     var docusignLog = FindDocuSignLog(org, envelopeId);
                     if (docusignLog == null)
                     {
-                        MarkWebhookLogFinal(org, webhookLogId, success: false, failedReason: "No ntw_docusignlog for envelopeId");
-                        Console.Out.WriteLine(Newtonsoft.Json.JsonConvert.SerializeObject(new
-                        {
-                            ok = false,
-                            source = "crm",
-                            where = "execute",
-                            error = "No ntw_docusignlog found for envelopeId"
-                        }));
+                        MarkWebhookLogFinal(org, webhookLogId, false, "No ntw_docusignlog for envelopeId");
+                        WriteResult(false, "crm", "execute", "No ntw_docusignlog found for envelopeId");
                         return 2;
                     }
-
                     var docusignLogId = docusignLog.Id;
 
-                    // 7) Add a small audit note (no file) for traceability
-                    var noteBody = BuildNoteBody(status, emailSubject, senderUser, senderMail);
-                    CreateNoteOnDocusignLog(org, docusignLogId,
-                        subject: $"DocuSign Event: {eventName}",
-                        body: noteBody);
+                    // Small audit note
+                    CreateNote(org, docusignLogId, "DocuSign Event: " + eventName, BuildNoteBody(status, emailSubject, senderUser, senderMail));
 
-                    // 8) Branch by event
+                    // 6) On completed: upload via CUSTOM API only
                     if (IsCompleted(eventName))
                     {
                         if (!string.IsNullOrWhiteSpace(pdfBase64))
@@ -217,18 +115,46 @@ namespace CrmInvoker
                             var fileName = string.IsNullOrWhiteSpace(docName) ? "SignedDocument.pdf" : docName;
                             var base64Payload = StripDataPrefix(pdfBase64);
 
-                            // === DIRECT FILE-COLUMN UPLOAD (Blocks API) ===
-                            UploadToFileColumnViaBlocks(
-                                org,
-                                entityLogicalName: "ntw_docusignlog",
-                                id: docusignLogId,
-                                fileAttributeLogicalName: "ntw_signeddocument",
-                                fileName: fileName,
-                                mimeType: "application/pdf",
-                                base64: base64Payload);
+                            Console.Error.WriteLine("[UPLOAD] Execute ntw_UploadBase64ToFile → ntw_docusignlog.ntw_signeddocument");
+                            var req = new OrganizationRequest("ntw_UploadBase64ToFile")
+                            {
+                                ["EntityLogicalName"] = "ntw_docusignlog",
+                                ["RecordId"] = docusignLogId.ToString(),
+                                ["FileAttributeLogicalName"] = "ntw_signeddocument",
+                                ["FileName"] = fileName,
+                                ["Base64Payload"] = base64Payload,
+                                ["VerboseTrace"] = true // matches screenshot: Boolean, optional=yes
+                            };
+
+                            try
+                            {
+                                var resp = org.Execute(req);
+
+                                // Screenshot shows Response Properties: Field (string), MimeType (string), FileSize (int)
+                                var field = resp.Results.Contains("Field") ? resp.Results["Field"] as string : null;
+                                var mime = resp.Results.Contains("MimeType") ? resp.Results["MimeType"] as string : null;
+                                var size = resp.Results.Contains("FileSize") ? Convert.ToInt32(resp.Results["FileSize"]) : 0;
+
+                                var audit = new StringBuilder()
+                                    .AppendLine("Stored via ntw_UploadBase64ToFile")
+                                    .AppendLine("Entity: ntw_docusignlog")
+                                    .AppendLine("Attribute: ntw_signeddocument")
+                                    .AppendLine("Name: " + fileName)
+                                    .AppendLine("MimeType: " + (mime ?? "<n/a>"))
+                                    .AppendLine("FileSize: " + size + " bytes")
+                                    .AppendLine("Field: " + (field ?? "<n/a>"))
+                                    .ToString();
+
+                                CreateNote(org, docusignLogId, "Signed PDF stored", audit);
+                            }
+                            catch (Exception ex)
+                            {
+                                CreateNote(org, docusignLogId, "Signed PDF upload failed", ex.ToString());
+                                throw;
+                            }
                         }
 
-                        // Set to Inactive/Signed (hard values you requested)
+                        // Mark as inactive/signed
                         var upd = new Entity("ntw_docusignlog", docusignLogId)
                         {
                             ["statecode"] = new OptionSetValue(STATE_INACTIVE),
@@ -236,78 +162,28 @@ namespace CrmInvoker
                         };
                         org.Update(upd);
 
-                        MarkWebhookLogFinal(org, webhookLogId, success: true, failedReason: null);
-                        Console.Out.WriteLine(Newtonsoft.Json.JsonConvert.SerializeObject(new
-                        {
-                            ok = true,
-                            source = "crm",
-                            where = "execute",
-                            handled = "completed",
-                            envelopeId
-                        }));
+                        MarkWebhookLogFinal(org, webhookLogId, true, null);
+                        WriteResult(true, "crm", "execute", "completed", envelopeId);
                         return 0;
                     }
-                    else if (IsFinishLater(eventName))
-                    {
-                        MarkWebhookLogFinal(org, webhookLogId, success: true, failedReason: "Finish later");
-                        Console.Out.WriteLine(Newtonsoft.Json.JsonConvert.SerializeObject(new
-                        {
-                            ok = true,
-                            source = "crm",
-                            where = "execute",
-                            handled = "finish-later",
-                            envelopeId
-                        }));
-                        return 0;
-                    }
-                    else if (IsDeclined(eventName))
-                    {
-                        MarkWebhookLogFinal(org, webhookLogId, success: true, failedReason: "Declined");
-                        Console.Out.WriteLine(Newtonsoft.Json.JsonConvert.SerializeObject(new
-                        {
-                            ok = true,
-                            source = "crm",
-                            where = "execute",
-                            handled = "declined",
-                            envelopeId
-                        }));
-                        return 0;
-                    }
-                    else
-                    {
-                        // Unhandled event: just mark processed
-                        MarkWebhookLogFinal(org, webhookLogId, success: true, failedReason: "Unhandled event");
-                        Console.Out.WriteLine(Newtonsoft.Json.JsonConvert.SerializeObject(new
-                        {
-                            ok = true,
-                            source = "crm",
-                            where = "execute",
-                            handled = "unhandled",
-                            eventName,
-                            envelopeId
-                        }));
-                        return 0;
-                    }
+
+                    // Other cases
+                    if (IsFinishLater(eventName)) { MarkWebhookLogFinal(org, webhookLogId, true, "Finish later"); WriteResult(true, "crm", "execute", "finish-later", envelopeId); return 0; }
+                    if (IsDeclined(eventName)) { MarkWebhookLogFinal(org, webhookLogId, true, "Declined"); WriteResult(true, "crm", "execute", "declined", envelopeId); return 0; }
+
+                    MarkWebhookLogFinal(org, webhookLogId, true, "Unhandled event");
+                    WriteResult(true, "crm", "execute", "unhandled", envelopeId);
+                    return 0;
                 }
             }
             catch (Exception ex)
             {
-                Console.Out.WriteLine(Newtonsoft.Json.JsonConvert.SerializeObject(new
-                {
-                    ok = false,
-                    source = "crm",
-                    where = "execute",
-                    error = ex.Message
-                }));
+                WriteResult(false, "crm", "execute", ex.Message);
                 return 2;
             }
         }
 
-        private static string BuildNoteBody(
-         string summaryStatus,
-         string emailSubject,
-         string senderUserName,
-         string senderEmail)
+        private static string BuildNoteBody(string summaryStatus, string emailSubject, string senderUserName, string senderEmail)
         {
             var sb = new StringBuilder();
             if (!string.IsNullOrWhiteSpace(summaryStatus)) sb.AppendLine("Status: " + summaryStatus);
@@ -317,74 +193,16 @@ namespace CrmInvoker
             return sb.Length == 0 ? "DocuSign event received." : sb.ToString();
         }
 
-        // ===== FILE BLOCKS UPLOAD (late-bound requests; on-prem compatible) =====
-        private static void UploadToFileColumnViaBlocks(
-            IOrganizationService org,
-            string entityLogicalName,
-            Guid id,
-            string fileAttributeLogicalName,
-            string fileName,
-            string mimeType,
-            string base64)
+        // ---------- helpers ----------
+        private static void WriteResult(bool ok, string source, string where, string message, string envelopeId = null)
         {
-            if (org == null) throw new InvalidPluginExecutionException("org is null.");
-            if (string.IsNullOrWhiteSpace(entityLogicalName)) throw new InvalidPluginExecutionException("entityLogicalName is empty.");
-            if (id == Guid.Empty) throw new InvalidPluginExecutionException("id is empty.");
-            if (string.IsNullOrWhiteSpace(fileAttributeLogicalName)) throw new InvalidPluginExecutionException("fileAttributeLogicalName is empty.");
-            if (string.IsNullOrWhiteSpace(fileName)) fileName = "file.bin";
-            if (string.IsNullOrWhiteSpace(mimeType)) mimeType = "application/octet-stream";
-            if (string.IsNullOrWhiteSpace(base64)) throw new InvalidPluginExecutionException("Base64 content is empty.");
-
-            byte[] bytes;
-            try { bytes = Convert.FromBase64String(base64); }
-            catch (Exception ex) { throw new InvalidPluginExecutionException("Invalid Base64 content: " + ex.Message); }
-
-            // Block size (default 4MB); can override via AppSettings["Uploader.BlockSize"]
-            int blockSize = GetIntSetting("Uploader.BlockSize") ?? 4 * 1024 * 1024;
-
-            // 1) Initialize
-            var initReq = new OrganizationRequest("InitializeFileBlocksUpload")
-            {
-                ["Target"] = new EntityReference(entityLogicalName, id),
-                ["FileAttributeName"] = fileAttributeLogicalName,
-                ["FileName"] = fileName
-            };
-            var initResp = org.Execute(initReq);
-            var token = (string)initResp.Results["FileContinuationToken"];
-
-            // 2) Upload blocks
-            var blockIds = new List<string>();
-            int offset = 0;
-            while (offset < bytes.Length)
-            {
-                int len = Math.Min(blockSize, bytes.Length - offset);
-                var chunk = new byte[len];
-                Buffer.BlockCopy(bytes, offset, chunk, 0, len);
-                offset += len;
-
-                var blockId = Convert.ToBase64String(Encoding.UTF8.GetBytes(Guid.NewGuid().ToString()));
-                var upReq = new OrganizationRequest("UploadBlock")
-                {
-                    ["FileContinuationToken"] = token,
-                    ["BlockId"] = blockId,
-                    ["BlockData"] = chunk
-                };
-                org.Execute(upReq);
-                blockIds.Add(blockId);
-            }
-
-            // 3) Commit
-            var commitReq = new OrganizationRequest("CommitFileBlocksUpload")
-            {
-                ["FileContinuationToken"] = token,
-                ["BlockList"] = blockIds.ToArray(),
-                ["FileName"] = fileName,
-                ["MimeType"] = mimeType
-            };
-            org.Execute(commitReq);
+            Console.Out.WriteLine(Newtonsoft.Json.JsonConvert.SerializeObject(
+                envelopeId == null
+                    ? new { ok, source, where, error = ok ? null : message, handled = ok ? message : null }
+                    : new { ok, source, where, handled = message, envelopeId }
+            ));
         }
 
-        // ===== Utilities =====
         private static string StripDataPrefix(string b64)
         {
             var s = (b64 ?? "").Trim();
@@ -392,9 +210,9 @@ namespace CrmInvoker
             return i >= 0 ? s.Substring(i + "base64,".Length) : s;
         }
 
-        private static string EnsurePdfName(string nameFromPayload)
+        private static string EnsurePdfName(string name)
         {
-            var n = (nameFromPayload ?? "Document").Trim();
+            var n = (name ?? "Document").Trim();
             var i = n.LastIndexOf('.');
             if (i > 0) n = n.Substring(0, i);
             return n + ".pdf";
@@ -403,162 +221,74 @@ namespace CrmInvoker
         private static bool IsCompleted(string evt) =>
             evt.Equals("recipient-completed", StringComparison.OrdinalIgnoreCase) ||
             evt.Equals("envelope-completed", StringComparison.OrdinalIgnoreCase);
+        private static bool IsFinishLater(string evt) => evt.Equals("recipient-finish-later", StringComparison.OrdinalIgnoreCase);
+        private static bool IsDeclined(string evt) => evt.Equals("recipient-declined", StringComparison.OrdinalIgnoreCase);
 
-        private static bool IsFinishLater(string evt) =>
-            evt.Equals("recipient-finish-later", StringComparison.OrdinalIgnoreCase);
-
-        private static bool IsDeclined(string evt) =>
-            evt.Equals("recipient-declined", StringComparison.OrdinalIgnoreCase);
-
-        private static string GetAppSetting(string key, string fallback = "")
-            => ConfigurationManager.AppSettings[key] ?? fallback;
-
-        private static int? GetIntSetting(string key)
-            => int.TryParse(ConfigurationManager.AppSettings[key], out var v) ? v : (int?)null;
-
-        private static Guid CreateWebhookLog(
-            IOrganizationService org,
-            string correlationId,
-            string eventName,
-            string envelopeId,
-            string summaryStatus,
-            string senderUserName,
-            string senderEmail,
-            string payloadRaw)
+        private static Guid CreateWebhookLog(IOrganizationService org, string corr, string evt, string envId,
+            string summaryStatus, string senderUser, string senderMail, string payloadRaw)
         {
-            // ENTITY / FIELD NAMES — set to yours
-            const string Entity = "ntw_webhooklog";
-            const string Name = "ntw_name";
-            const string Source = "ntw_sourcesystem";
-            const string Payload = "ntw_payload";
-            const string Corr = "ntw_correlationid";
-            const string State = "statecode";
-            const string Status = "statuscode";
-
-            // status values (Active/Received) from config (fallback defaults)
-            var activeState = GetIntSetting("WebhookLog.ActiveState") ?? 0;
-            var receivedStatus = GetIntSetting("WebhookLog.ReceivedStatus") ?? 1;
+            const string Entity = "ntw_webhooklog", Name = "ntw_name", Source = "ntw_sourcesystem",
+                         Payload = "ntw_payload", Corr = "ntw_correlationid", State = "statecode", Status = "statuscode";
+            var activeState = int.TryParse(ConfigurationManager.AppSettings["WebhookLog.ActiveState"], out var a) ? a : 0;
+            var receivedStatus = int.TryParse(ConfigurationManager.AppSettings["WebhookLog.ReceivedStatus"], out var b) ? b : 1;
 
             var e = new Entity(Entity);
             e[Name] = $"DocuSign Webhook {DateTime.UtcNow:u}";
             e[Source] = "DocuSign";
-            e[Payload] = BuildCompactAuditJson(eventName, envelopeId, summaryStatus, senderUserName, senderEmail);
-            e[Corr] = correlationId;
+            e[Payload] = new JObject { ["event"] = evt ?? "", ["envelopeId"] = envId ?? "", ["status"] = summaryStatus ?? "", ["sender"] = senderUser ?? "", ["email"] = senderMail ?? "" }.ToString(Newtonsoft.Json.Formatting.None);
+            e[Corr] = corr;
             e[State] = new OptionSetValue(activeState);
             e[Status] = new OptionSetValue(receivedStatus);
-
             return org.Create(e);
         }
 
-        private static void MarkWebhookLogFinal(
-            IOrganizationService org,
-            Guid webhookLogId,
-            bool success,
-            string failedReason)
+        private static void MarkWebhookLogFinal(IOrganizationService org, Guid id, bool success, string reason)
         {
-            const string Entity = "ntw_webhooklog";
-            const string State = "statecode";
-            const string Status = "statuscode";
-            const string Payload = "ntw_payload";
+            const string Entity = "ntw_webhooklog", State = "statecode", Status = "statuscode", Payload = "ntw_payload";
+            var inactiveState = int.TryParse(ConfigurationManager.AppSettings["WebhookLog.InactiveState"], out var a) ? a : 1;
+            var processedStatus = int.TryParse(ConfigurationManager.AppSettings["WebhookLog.ProcessedStatus"], out var b) ? b : 2;
+            var failedStatus = int.TryParse(ConfigurationManager.AppSettings["WebhookLog.FailedStatus"], out var c) ? c : 202370000;
 
-            var inactiveState = GetIntSetting("WebhookLog.InactiveState") ?? 1;
-            var processedStatus = GetIntSetting("WebhookLog.ProcessedStatus") ?? 2;
-            var failedStatus = GetIntSetting("WebhookLog.FailedStatus") ?? 202370000;
-
-            var upd = new Entity(Entity, webhookLogId);
+            var upd = new Entity(Entity, id);
             upd[State] = new OptionSetValue(inactiveState);
             upd[Status] = new OptionSetValue(success ? processedStatus : failedStatus);
-            if (!success && !string.IsNullOrWhiteSpace(failedReason))
-                upd[Payload] = "[FAIL:" + failedReason + "]";
+            if (!success && !string.IsNullOrWhiteSpace(reason)) upd[Payload] = "[FAIL:" + reason + "]";
             org.Update(upd);
         }
 
-        private static string BuildCompactAuditJson(
-            string eventName, string envelopeId, string status, string senderUser, string senderMail)
+        private static bool IsValidSourceToken(IOrganizationService org, string schemaName, string incomingToken)
         {
-            var o = new JObject
-            {
-                ["event"] = eventName ?? "",
-                ["envelopeId"] = envelopeId ?? "",
-                ["status"] = status ?? "",
-                ["sender"] = senderUser ?? "",
-                ["email"] = senderMail ?? ""
-            };
-            return o.ToString(Newtonsoft.Json.Formatting.None);
-        }
+            if (string.IsNullOrWhiteSpace(schemaName)) return true;
+            var defQ = new QueryExpression("environmentvariabledefinition") { ColumnSet = new ColumnSet("environmentvariabledefinitionid", "schemaname") };
+            defQ.Criteria.AddCondition("schemaname", ConditionOperator.Equal, schemaName);
+            var defs = org.RetrieveMultiple(defQ);
+            if (defs.Entities.Count == 0) return true;
 
-        private static bool IsValidSourceToken(
-            IOrganizationService org,
-            string incomingToken)
-        {
-            var envVarSchema = GetAppSetting("Env.WebhookValidationToken.Schema", "");
-            if (string.IsNullOrWhiteSpace(envVarSchema))
-            {
-                // No schema configured => allow all
-                return true;
-            }
+            var valQ = new QueryExpression("environmentvariablevalue") { ColumnSet = new ColumnSet("value", "environmentvariabledefinitionid") };
+            valQ.Criteria.AddCondition("environmentvariabledefinitionid", ConditionOperator.Equal, defs.Entities[0].Id);
+            var vals = org.RetrieveMultiple(valQ);
+            var expected = vals.Entities.Count == 0 ? null : vals.Entities[0].GetAttributeValue<string>("value");
+            if (string.IsNullOrWhiteSpace(expected)) return true;
 
-            var expected = ReadEnvValue(org, envVarSchema);
-            if (string.IsNullOrWhiteSpace(expected))
-            {
-                // Env var not set => allow all
-                return true;
-            }
-
-            if (string.IsNullOrWhiteSpace(incomingToken))
-                return false;
-
+            if (string.IsNullOrWhiteSpace(incomingToken)) return false;
             return string.Equals(expected.Trim(), incomingToken.Trim(), StringComparison.Ordinal);
         }
 
-        private static string ReadEnvValue(IOrganizationService org, string schemaName)
+        private static Entity FindDocuSignLog(IOrganizationService org, string envId)
         {
-            // environmentvariabledefinition / environmentvariablevalue
-            var defQ = new QueryExpression("environmentvariabledefinition")
-            {
-                ColumnSet = new ColumnSet("environmentvariabledefinitionid", "schemaname")
-            };
-            defQ.Criteria.AddCondition("schemaname", ConditionOperator.Equal, schemaName);
-            var defs = org.RetrieveMultiple(defQ);
-            if (defs.Entities.Count == 0) return null;
-
-            var defId = defs.Entities[0].Id;
-
-            var valQ = new QueryExpression("environmentvariablevalue")
-            {
-                ColumnSet = new ColumnSet("value", "environmentvariabledefinitionid")
-            };
-            valQ.Criteria.AddCondition("environmentvariabledefinitionid", ConditionOperator.Equal, defId);
-            var vals = org.RetrieveMultiple(valQ);
-            if (vals.Entities.Count == 0) return null;
-
-            return vals.Entities[0].GetAttributeValue<string>("value");
-        }
-
-        private static Entity FindDocuSignLog(IOrganizationService org, string envelopeId)
-        {
-            const string Entity = "ntw_docusignlog";
-            const string EnvelopeField = "ntw_envelopid"; // your actual logical name
-            var q = new QueryExpression(Entity)
-            {
-                ColumnSet = new ColumnSet("activityid")
-            };
-            q.Criteria.AddCondition(EnvelopeField, ConditionOperator.Equal, envelopeId);
+            const string Entity = "ntw_docusignlog", EnvelopeField = "ntw_envelopid";
+            var q = new QueryExpression(Entity) { ColumnSet = new ColumnSet("activityid") };
+            q.Criteria.AddCondition(EnvelopeField, ConditionOperator.Equal, envId);
             var r = org.RetrieveMultiple(q);
             return r.Entities.FirstOrDefault();
         }
 
-        // ——— CreateNote helpers (no attachment variant only) ———
-        private static void CreateNoteOnDocusignLog(
-            IOrganizationService org,
-            Guid docusignLogId,
-            string subject,
-            string body)
+        private static void CreateNote(IOrganizationService org, Guid logId, string subject, string body)
         {
             var note = new Entity("annotation");
-            note["subject"] = string.IsNullOrWhiteSpace(subject) ? "DocuSign Event" : subject;
+            note["subject"] = string.IsNullOrWhiteSpace(subject) ? "DocuSign" : subject;
             note["notetext"] = string.IsNullOrWhiteSpace(body) ? subject : body;
-            note["objectid"] = new EntityReference("ntw_docusignlog", docusignLogId);
+            note["objectid"] = new EntityReference("ntw_docusignlog", logId);
             org.Create(note);
         }
     }
