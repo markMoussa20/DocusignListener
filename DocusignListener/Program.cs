@@ -6,10 +6,50 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.IO;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.WebHost.UseKestrel(o => o.Limits.MaxRequestBodySize = 50 * 1024 * 1024);
 var app = builder.Build();
+var logLock = new object();
+
+
+void FileLog(IConfiguration cfg, string level, string correlationId, string message, string? extra = null)
+
+{
+    try
+    {
+        var dir = cfg["LogPath"];
+        if (string.IsNullOrWhiteSpace(dir)) return;
+
+        Directory.CreateDirectory(dir);
+
+        var file = Path.Combine(dir, $"listener-{DateTime.UtcNow:yyyy-MM-dd}.log");
+        var line =
+            $"{DateTime.UtcNow:O} [{level}] [{correlationId}] {message}" +
+            (string.IsNullOrWhiteSpace(extra) ? "" : $" | {extra}") +
+            Environment.NewLine;
+
+        lock (logLock)
+
+            File.AppendAllText(file, line, Encoding.UTF8);
+    }
+    catch
+    {
+        // don't break webhook because logging failed
+    }
+}
+
+string Trunc(IConfiguration cfg, string s)
+
+{
+    var max = 20000;
+    _ = int.TryParse(cfg["LogBodyMaxChars"], out max);
+    if (max <= 0) max = 20000;
+    if (string.IsNullOrEmpty(s)) return s;
+    return s.Length <= max ? s : s.Substring(0, max) + " ...[TRUNCATED]";
+}
+
 
 // -------- settings for local testing ----------
 const bool REQUIRE_BASIC = true;
