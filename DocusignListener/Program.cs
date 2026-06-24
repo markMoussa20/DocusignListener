@@ -11,6 +11,7 @@ using System.IO;
 var builder = WebApplication.CreateBuilder(args);
 builder.WebHost.UseKestrel(o => o.Limits.MaxRequestBodySize = 50 * 1024 * 1024);
 var app = builder.Build();
+
 var logLock = new object();
 
 
@@ -49,6 +50,8 @@ string Trunc(IConfiguration cfg, string s)
     if (string.IsNullOrEmpty(s)) return s;
     return s.Length <= max ? s : s.Substring(0, max) + " ...[TRUNCATED]";
 }
+FileLog(builder.Configuration, "INFO", "startup", "Listener started",
+    $"BaseDir={AppContext.BaseDirectory}");
 
 
 // -------- settings for local testing ----------
